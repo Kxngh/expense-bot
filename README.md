@@ -127,63 +127,77 @@ On **WhatsApp → Configuration → Webhook**:
 ### 6. Say hi
 Send `/help` to the test number from your phone.
 
-## Free hosting: Render + Neon (₹0)
+## Free hosting (₹0)
 
-The app runs on Render's free tier, and the data lives in Neon's free Postgres.
+| Host | Card needed | Replies when idle | Fit |
+|---|---|---|---|
+| **Vercel + Neon** (recommended) | No | A few seconds (serverless cold start) | Best free option |
+| Render + Neon | No | About 1 minute (wakes after 15 min of sleep) | Works, just slower |
+| Oracle Cloud Always Free VM | Yes | Instant, always on | Good if you get a VM |
+| Google Cloud Run + Neon | Yes (billing account) | A few seconds | Generous free tier |
 
-**Limits to know:**
-- **Render free:** the app sleeps after 15 minutes with no traffic and takes about a minute to wake. Its disk is wiped on every restart, which is why the data lives in Neon. You get 750 free hours a month, enough for one app running all month.
-- **Neon free:** 1 GB of storage and 100 compute-hours a month, with no expiry and no card needed. The database sleeps after 5 idle minutes and wakes in well under a second.
-- **How this app stays inside those limits:**
-  - Database connections close after a minute idle.
-  - The report scheduler only touches the database when a report is actually due, not every minute.
-  - Neon is awake only for a few minutes around each message. 2–5 people use a small fraction of the 100 hours.
+Koyeb, Fly.io and Railway no longer have a usable free tier for this: they want a card hold, a trial, or a tiny monthly credit.
 
-### 1. Neon (database)
-1. Sign up at <https://neon.tech> and create a project. Pick the **AWS Asia Pacific (Singapore)** region, the closest one to India.
-2. Copy the **connection string**. Use the **pooled** one, whose hostname contains `-pooler`. It looks like `postgresql://user:pass@ep-xxx-pooler.ap-southeast-1.aws.neon.tech/neondb?sslmode=require`.
+All of them use **Neon** for the database (free, no card): 1 GB of storage and 100 compute-hours a month. The app keeps Neon asleep when nobody is using it.
+- Database connections close after a minute idle.
+- The report scheduler doesn't poll the database every minute.
 
-The tables are created automatically on first start.
+### Step 1. Neon (database)
+1. Sign up at <https://neon.tech> and create a project in **AWS Asia Pacific (Singapore)**.
+2. Copy the **pooled** connection string, whose hostname contains `-pooler`. It goes in `DATABASE_URL`.
 
-### 2. Render (app)
+The tables are created automatically on first use.
+
+### Step 2a. Vercel (recommended)
+Vercel runs the app as serverless functions. Each webhook starts the app if needed (a few seconds), handles the message, and replies. The project already includes `index.py` and `vercel.json`, which runs the functions in Singapore next to Neon.
+
 1. Push this folder to a **private** GitHub repo.
-2. On <https://render.com>, click **New → Blueprint** and pick the repo. `render.yaml` sets up a free Python web service.
-3. Fill in the environment variables it asks for:
-   - `DATABASE_URL`: the Neon string from step 1
+2. Sign up at <https://vercel.com> with GitHub. The **Hobby** plan is free, needs no card, and is meant for personal projects like this.
+3. Click **Add New → Project** and import the repo. Vercel detects the Python app on its own.
+4. Under **Environment Variables**, add:
+   - `DATABASE_URL`
    - `WHATSAPP_TOKEN`, `PHONE_NUMBER_ID`, `VERIFY_TOKEN`, `APP_SECRET`
-   - `ALLOWED_NUMBERS`, `GEMINI_API_KEY`, `BOT_OWNER_NAME`
-4. Once it's live, your webhook URL is `https://<service-name>.onrender.com/webhook`. Put it in Meta's webhook settings (setup step 5).
+   - `ALLOWED_NUMBERS`, `GEMINI_API_KEY`, `LLM_PROVIDER=gemini`
+   - `BOT_OWNER_NAME`, `CRON_SECRET`
+5. Click **Deploy**. Your webhook URL is `https://<project>.vercel.app/webhook`. Put it in Meta's webhook settings (setup step 5).
 
-Choose a region close to Neon's, like Singapore, so database calls are quick.
+Vercel sets `VERCEL=1` automatically, and the app switches to serverless mode:
+- It handles each message before responding, because a function can be frozen right after it responds.
+- It sets up the database on first use.
+- It leaves reports to the cron jobs in Step 3.
 
-### 3. Wake it up for reports (free)
-Render's app sleeps when idle, and a sleeping app can't send reports. A free external cron wakes it at report time:
+If Meta's webhook check fails with a 401 from Vercel, open **Project → Settings → Deployment Protection** and make sure the production URL isn't protected.
 
-1. Make up a long random string and add it on Render as `CRON_SECRET`.
-2. At <https://cron-job.org>, create a free account and add **two jobs**:
+### Step 2b. Render (alternative)
+1. Push to a private GitHub repo.
+2. On Render, click **New → Blueprint** and pick the repo. `render.yaml` sets up a free web service.
+3. Fill in the same environment variables.
 
-| Job | URL | Schedule (time zone Asia/Kolkata) |
+The webhook URL is `https://<service-name>.onrender.com/webhook`. The app sleeps after 15 idle minutes, so the first reply after a quiet spell takes about a minute. Meta retries webhooks, so no messages are lost.
+
+### Step 3. Reports on schedule (cron-job.org, free)
+On serverless or sleeping hosts nothing runs between requests, so a free external cron triggers the reports:
+
+1. Pick a long random `CRON_SECRET` and add it to your host's environment variables.
+2. At <https://cron-job.org>, add two jobs that call `https://<your-app>/tasks/reports?key=<CRON_SECRET>`:
+
+| Job | Schedule (time zone Asia/Kolkata) | UTC equivalent |
 |---|---|---|
-| Weekly report | `https://<service-name>.onrender.com/tasks/reports?key=<CRON_SECRET>` | Sundays at **20:01** and **20:06** |
-| Monthly report | same URL | 1st of every month at **09:01** and **09:06** |
+| Weekly report | Sundays at **20:01** and **20:06** | Sundays 14:31 and 14:36 |
+| Monthly report | 1st of the month at **09:01** and **09:06** | 1st at 03:31 and 03:36 |
 
-If a job only lets you pick UTC, use Sunday 14:31 and 14:36, and the 1st at 03:31 and 03:36.
+The second run is a safety net in case the first one times out while the app starts. Each report is only ever sent once, however often the URL is called.
 
-**Why two runs:** the first call may time out while Render is waking up, which takes about a minute. That's fine, because waking up already triggers the reports. The second call, 5 minutes later, is a safety net. Each report is only ever sent once, however many times the URL is called.
+Reports reach everyone who messaged the bot in the last 24 hours (WhatsApp's rule). Everyone else gets theirs with their next message.
 
-**Who gets a report on time:** anyone who messaged the bot in the last 24 hours, which is WhatsApp's rule. Everyone else gets it with their next message.
+On an always-on server (Oracle, or `uvicorn` on your own machine), the app checks for due reports every minute by itself, so the cron is optional there.
 
-**Cost:** about 4–8 short wake-ups a month, well inside Render's 750 free hours. The rest of the week the app sleeps, and the first reply after a quiet spell takes about a minute.
-
-If you also want instant replies at any hour, add a third job that opens `https://<service-name>.onrender.com/health` every 10 minutes. That route never touches the database, so it uses no Neon hours.
-
-### Other options
-- **Oracle Cloud Always Free VM:** always on with a persistent disk, so SQLite works and you don't need Neon. Use the Dockerfile:
-  ```bash
-  docker build -t expense-bot .
-  docker run -d --env-file .env -v $(pwd)/data:/data -p 8000:8000 expense-bot
-  ```
-- **Any other host:** set `DATABASE_URL` to any Postgres, or leave it empty to use the SQLite file.
+### Oracle Cloud VM (alternative)
+Oracle's VM is always on with a persistent disk, so SQLite works and you don't need Neon:
+```bash
+docker build -t expense-bot .
+docker run -d --env-file .env -v $(pwd)/data:/data -p 8000:8000 expense-bot
+```
 
 ## Costs
 - **WhatsApp**: replies to messages you send are free. The bot never messages you first, so it stays in the free tier.

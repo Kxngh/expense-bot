@@ -1,6 +1,7 @@
 """FastAPI app exposing the WhatsApp webhook.
 
 Run:  uvicorn app.main:app --host 0.0.0.0 --port 8000
+Also runs serverless (Vercel): set SERVERLESS=on (Vercel sets VERCEL=1 automatically).
 """
 import asyncio
 import hashlib
@@ -18,19 +19,33 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 log = logging.getLogger("expense-bot")
 
 wa: WhatsApp | None = None
+_db_ready = False
+
+
+def ensure_ready():
+    """Idempotent setup. Serverless platforms may never run the lifespan hook, so every
+    entry point calls this instead of relying on startup."""
+    global wa, _db_ready
+    if not _db_ready:
+        db.init()
+        _db_ready = True
+        if not config.APP_SECRET and not config.ALLOW_UNSIGNED_WEBHOOKS:
+            log.error("APP_SECRET is not set: all webhooks will be rejected. Set it from App settings > Basic.")
+    if wa is None:
+        wa = WhatsApp()
 
 
 @asynccontextmanager
 async def lifespan(_app):
-    global wa
-    db.init()
-    if not config.APP_SECRET and not config.ALLOW_UNSIGNED_WEBHOOKS:
-        log.error("APP_SECRET is not set: all webhooks will be rejected. Set it from App settings > Basic.")
-    client = wa = WhatsApp()
-    scheduler = asyncio.create_task(report_loop())
+    ensure_ready()
+    # On a normal server, check for due reports every minute. Serverless instances are
+    # frozen between requests, so there the cron-job.org call to /tasks/reports does it.
+    scheduler = None if config.SERVERLESS else asyncio.create_task(report_loop())
     yield
-    scheduler.cancel()
-    await client.http.aclose()
+    if scheduler:
+        scheduler.cancel()
+    if wa is not None and hasattr(wa, "http"):
+        await wa.http.aclose()
     db.close()
 
 
@@ -62,6 +77,7 @@ async def run_reports(key: str = Query("")):
     """
     if not config.CRON_SECRET or not hmac.compare_digest(key, config.CRON_SECRET):
         raise HTTPException(403, "Forbidden")
+    ensure_ready()
     n = await reports.tick(wa, handler.deliver)
     return {"ok": True, "reports": n}
 
@@ -108,6 +124,7 @@ async def receive(request: Request, background: BackgroundTasks):
     body = await request.body()
     if not _valid_signature(body, request.headers.get("x-hub-signature-256")):
         raise HTTPException(401, "Bad signature")
+    ensure_ready()
 
     payload = await request.json()
     for entry in payload.get("entry", []):
@@ -122,6 +139,12 @@ async def receive(request: Request, background: BackgroundTasks):
                 if not db.mark_processed(msg["id"]):
                     continue  # Meta retried a webhook we already handled
                 db.touch_user(sender)  # opens the 24h window for scheduled reports
-                background.add_task(process, msg, names.get(sender))
-    # Always 200 quickly, or Meta keeps retrying
+                if config.SERVERLESS:
+                    # Serverless functions may be frozen as soon as the response is sent,
+                    # so finish the work first (a few seconds; Meta retries if we're slow,
+                    # and the dedupe above makes retries harmless).
+                    await process(msg, names.get(sender))
+                else:
+                    background.add_task(process, msg, names.get(sender))
+    # Return 200 quickly, or Meta keeps retrying
     return {"status": "ok"}

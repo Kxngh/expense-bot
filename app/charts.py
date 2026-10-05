@@ -1,10 +1,16 @@
 """PNG charts sent back into WhatsApp. Rendered with matplotlib (no display needed)."""
 import io
+import os
 import re
+import tempfile
 from calendar import monthrange
 from datetime import date
 
-import matplotlib
+# Serverless filesystems are read-only except /tmp; matplotlib needs a writable cache dir
+if not os.access(os.path.expanduser("~"), os.W_OK):
+    os.environ.setdefault("MPLCONFIGDIR", os.path.join(tempfile.gettempdir(), "matplotlib"))
+
+import matplotlib  # noqa: E402
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402

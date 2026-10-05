@@ -57,6 +57,10 @@ BOT_OWNER_NAME = os.getenv("BOT_OWNER_NAME", "the bot owner")
 # Webhooks must be signed by Meta (APP_SECRET). Only set this to "on" for local testing.
 ALLOW_UNSIGNED_WEBHOOKS = os.getenv("ALLOW_UNSIGNED_WEBHOOKS", "off").lower() in ("1", "on", "true", "yes")
 
+# Serverless hosting (Vercel sets VERCEL=1): process webhooks before responding and skip
+# the in-process scheduler (use the cron-job.org call to /tasks/reports instead).
+SERVERLESS = (os.getenv("SERVERLESS", "") or os.getenv("VERCEL", "")).lower() in ("1", "on", "true", "yes")
+
 # --- App ---
 DB_PATH = os.getenv("DB_PATH", "expenses.db")
 # Set to a Postgres URL (e.g. Neon's) to use Postgres instead of the SQLite file above
