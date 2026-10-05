@@ -1,0 +1,33 @@
+# Render Blueprint: free web service. The database lives on Neon (free), so nothing is
+# lost when Render's free instance restarts or sleeps.
+services:
+  - type: web
+    name: expense-bot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.7"
+      - key: DATABASE_URL          # Neon connection string
+        sync: false
+      - key: WHATSAPP_TOKEN
+        sync: false
+      - key: PHONE_NUMBER_ID
+        sync: false
+      - key: VERIFY_TOKEN
+        sync: false
+      - key: APP_SECRET
+        sync: false
+      - key: ALLOWED_NUMBERS
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: LLM_PROVIDER
+        value: gemini
+      - key: BOT_OWNER_NAME
+        sync: false
+      - key: CRON_SECRET           # used by cron-job.org to trigger reports
+        sync: false
