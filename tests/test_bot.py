@@ -91,6 +91,45 @@ def test_undo_delete_fix():
     assert db.recent(USER) == []
 
 
+def test_edit_command():
+    run(text("hinge membership 400"))
+    row = db.recent(USER)[0]
+    out = all_text(run(text(f"/edit {row['id']} 4000")))
+    assert "₹4,000" in out and "was ₹400" in out
+    assert db.get_expense(USER, row["id"])["amount"] == 4000
+    assert "Groceries" in all_text(run(text(f"/edit #{row['id']} grocery")))
+    assert "No entry" in all_text(run(text("/edit 999 50")))
+
+
+def test_correction_in_plain_words_fallback():
+    run(text("swiggy 220"))
+    run(text("hinge membership 400"))
+    out = all_text(run(text("oh no no its 4000 not 400")))
+    assert "updated" in out and "₹4,000" in out
+    rows = db.recent(USER)
+    assert len(rows) == 2  # corrected, not logged as a new expense
+    assert sorted(r["amount"] for r in rows) == [220, 4000]
+    # an older entry with the matching wrong amount is picked over the latest one
+    run(text("auto 80"))
+    run(text("its 250 not 220"))
+    assert sorted(r["amount"] for r in db.recent(USER)) == [80, 250, 4000]
+
+
+def test_llm_edit_intent(monkeypatch):
+    run(text("hinge membership 400"))
+    row = db.recent(USER)[0]
+    seen = {}
+
+    async def fake_parse(text="", image=None, image_mime="", wa_id=None):
+        seen["prompt"] = parser._system_prompt(wa_id)
+        return parser._from_tool({"intent": "edit", "edit": {"id": row["id"], "amount": 4000, "category": "Bogus"}})
+    monkeypatch.setattr(parser, "parse", fake_parse)
+    out = all_text(run(text("oh no no its 4000 not 400")))
+    assert f"#{row['id']}" in seen["prompt"]  # the model sees recent entries to know what to fix
+    assert "updated" in out
+    assert db.get_expense(USER, row["id"])["amount"] == 4000
+
+
 def test_trends_and_daily_charts():
     t = db.today()
     for i in range(0, 150, 9):

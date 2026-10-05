@@ -58,7 +58,7 @@ def log_expenses(wa_id: str, result: parser.ParseResult, source: str) -> list:
     if notes:
         lines.append("")
         lines += notes
-    lines.append("_Wrong? /undo or /fix <#> <category>_")
+    lines.append("_Wrong? Just tell me (\"it was 500\", \"that was yesterday\") or /undo_")
     return [("text", "\n".join(lines))]
 
 
@@ -92,6 +92,10 @@ async def handle(wa_id: str, msg: dict, wa) -> list:
 
     if result.intent == "log":
         return log_expenses(wa_id, result, source)
+    if result.intent == "edit" and result.edit:
+        e = result.edit
+        exp_id = e.get("id") if isinstance(e.get("id"), int) and e.get("id") > 0 else None
+        return commands.apply_edit(wa_id, exp_id, e)
     if result.intent == "settings" and result.settings:
         return settings.apply(wa_id, result.settings)
     if result.intent == "query" and result.query:

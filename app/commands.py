@@ -45,6 +45,8 @@ Weekly (Sun evening) and monthly (1st) arrive automatically
 /undo - delete last entry
 /delete 12 - delete entry #12
 /fix 12 groceries - change category
+/edit 12 4000 - change amount
+• or just say "it was 4000 not 400"
 /export - CSV of this month
 /deletemydata - erase everything
 
@@ -276,6 +278,73 @@ def cmd_fix(wa_id, args):
     return [("text", f"✏️ #{args[0].lstrip('#')} moved to {cat}.")]
 
 
+def parse_amount(s: str) -> float | None:
+    s = s.replace(",", "").replace("₹", "").lower().removeprefix("rs").strip()
+    try:
+        value = float(s[:-1]) * 1000 if s.endswith("k") else float(s)
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
+def apply_edit(wa_id, exp_id, changes: dict):
+    """Validates and applies changes to one expense. Keys: amount, category, description, date."""
+    row = db.get_expense(wa_id, exp_id) if exp_id else db.last_expense(wa_id)
+    if not row:
+        return [("text", "No entry with that number." if exp_id else "Nothing to edit yet.")]
+    fields = {}
+    if changes.get("amount") is not None:
+        try:
+            amt = float(changes["amount"])
+        except (TypeError, ValueError):
+            amt = 0
+        if amt <= 0:
+            return [("text", "That amount doesn't look right. Try: /edit 12 4000")]
+        fields["amount"] = amt
+    if changes.get("category"):
+        cat = categories.resolve(changes["category"], wa_id)
+        if not cat:
+            return [("text", "Unknown category. Options: " + ", ".join(categories.for_user(wa_id)))]
+        fields["category"] = cat
+    if changes.get("description"):
+        fields["description"] = str(changes["description"])[:100]
+    if changes.get("date"):
+        try:
+            d = date.fromisoformat(changes["date"])
+        except (TypeError, ValueError):
+            d = None
+        if d and d <= db.today():
+            fields["spent_on"] = d.isoformat()
+    fields = {k: v for k, v in fields.items() if v != row[k]}
+    if not fields:
+        return [("text", f"#{row['id']} already says {money(row['amount'])} · {row['category']} · {row['description']}.")]
+    db.update_expense(wa_id, row["id"], **fields)
+    new = db.get_expense(wa_id, row["id"])
+    was = []
+    if "amount" in fields:
+        was.append(money(row["amount"]))
+    if "category" in fields:
+        was.append(row["category"])
+    if "description" in fields:
+        was.append(row["description"])
+    if "spent_on" in fields:
+        was.append(date.fromisoformat(row["spent_on"]).strftime("%d %b"))
+    d = date.fromisoformat(new["spent_on"])
+    tag = "" if d == db.today() else f" · {d.strftime('%d %b')}"
+    return [("text", f"✏️ #{new['id']} updated: {money(new['amount'])} · {new['category']} · "
+                     f"{new['description']}{tag}\n_was {', '.join(was)}_")]
+
+
+def cmd_edit(wa_id, args):
+    if len(args) < 2 or not args[0].lstrip("#").isdigit():
+        return [("text", "Usage: /edit 12 4000  (or /fix 12 groceries for the category)")]
+    exp_id = int(args[0].lstrip("#"))
+    amt = parse_amount(args[1]) if len(args) == 2 else None
+    if amt is not None:
+        return apply_edit(wa_id, exp_id, {"amount": amt})
+    return apply_edit(wa_id, exp_id, {"category": " ".join(args[1:])})
+
+
 def cmd_export(wa_id, args):
     ym = _ym(args[0]) if args else None
     start, end = month_bounds(ym)
@@ -335,7 +404,7 @@ COMMANDS = {
     "month": cmd_month, "summary": cmd_month, "cat": cmd_cat, "category": cmd_cat,
     "trends": cmd_trends, "trend": cmd_trends, "daily": cmd_daily, "pace": cmd_daily,
     "recent": cmd_recent, "budget": cmd_budget, "budgets": cmd_budget, "undo": cmd_undo,
-    "delete": cmd_delete, "fix": cmd_fix, "export": cmd_export,
+    "delete": cmd_delete, "fix": cmd_fix, "edit": cmd_edit, "export": cmd_export,
     "report": cmd_report, "reports": cmd_reports_toggle, "categories": cmd_categories,
 }
 

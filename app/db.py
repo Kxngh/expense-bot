@@ -208,11 +208,32 @@ def update_category(wa_id, exp_id, category) -> bool:
         return cur.rowcount > 0
 
 
+EDITABLE = ("amount", "category", "description", "merchant", "spent_on")
+
+
+def update_expense(wa_id, exp_id, **fields) -> bool:
+    fields = {k: v for k, v in fields.items() if k in EDITABLE}
+    if not fields:
+        return False
+    if "amount" in fields:
+        fields["amount"] = round(float(fields["amount"]), 2)
+    sets = ", ".join(f"{k}=?" for k in fields)
+    with conn() as c:
+        cur = c.execute(f"UPDATE expenses SET {sets} WHERE wa_id=? AND id=?", (*fields.values(), wa_id, exp_id))
+        return cur.rowcount > 0
+
+
 def recent(wa_id, n=10):
     with conn() as c:
         return c.execute(
             "SELECT * FROM expenses WHERE wa_id=? ORDER BY spent_on DESC, id DESC LIMIT ?", (wa_id, n)
         ).fetchall()
+
+
+def recent_logged(wa_id, n=5):
+    """Most recently *logged* entries (by id), whatever date they're for."""
+    with conn() as c:
+        return c.execute("SELECT * FROM expenses WHERE wa_id=? ORDER BY id DESC LIMIT ?", (wa_id, n)).fetchall()
 
 
 def between(wa_id, start: date, end: date):

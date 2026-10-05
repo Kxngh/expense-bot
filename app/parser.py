@@ -24,12 +24,13 @@ class ParsedExpense:
 
 @dataclass
 class ParseResult:
-    intent: str  # "log" | "query" | "command" | "chat"
+    intent: str  # "log" | "query" | "settings" | "edit" | "command" | "chat"
     expenses: list[ParsedExpense] = field(default_factory=list)
     command: str = ""   # e.g. "/budget", for questions a built-in command answers
     reply: str = ""     # short reply for small talk / unclear input
     query: dict = field(default_factory=dict)  # structured filter for intent=query
     settings: dict = field(default_factory=dict)  # budgets / categories for intent=settings
+    edit: dict = field(default_factory=dict)  # changes to an existing entry for intent=edit
 
 
 def build_tool(cats: list[str]) -> dict:
@@ -42,8 +43,11 @@ def build_tool(cats: list[str]) -> dict:
         "properties": {
             "intent": {
                 "type": "string",
-                "enum": ["log", "query", "settings", "command", "chat"],
-                "description": "log = the message contains one or more expenses to save. "
+                "enum": ["log", "edit", "query", "settings", "command", "chat"],
+                "description": "log = the message contains one or more NEW expenses to save. "
+                               "edit = the user is correcting an entry already logged (wrong amount, "
+                               "category, description or date), e.g. 'no its 4000 not 400', 'make #8 500', "
+                               "'that was yesterday'. "
                                "settings = the user wants to set/change/remove a budget, or add/remove a category. "
                                "query = a question about amounts, counts, lists or comparisons of their spending. "
                                "command = a question about budgets, overall trends or spending pace "
@@ -109,9 +113,22 @@ def build_tool(cats: list[str]) -> dict:
                                           "description": "Custom categories to delete"},
                 },
             },
+            "edit": {
+                "type": "object",
+                "description": "For intent=edit: which entry to change and only the fields that change.",
+                "properties": {
+                    "id": {"type": "integer", "description": "Entry number (#). Use the latest entry if the user doesn't say."},
+                    "amount": {"type": "number", "description": "New amount in rupees"},
+                    "category": {"type": "string", "enum": cats},
+                    "description": {"type": "string", "description": "New 2-5 word description"},
+                    "date": {"type": "string", "description": "New date, YYYY-MM-DD"},
+                },
+                "required": ["id"],
+            },
             "command": {
                 "type": "string",
                 "description": "For intent=command: '/budget', '/trends', '/daily', '/recent', '/help', "
+                               "'/undo' or '/delete <#>' to remove an entry, "
                                "or for a full summary/report: '/report week', '/report lastweek', '/report month', '/report lastmonth'.",
             },
             "reply": {"type": "string", "description": "For intent=chat, a one-line friendly reply."},
@@ -124,7 +141,15 @@ def build_tool(cats: list[str]) -> dict:
 TOOL = build_tool(categories.CATEGORIES)
 
 
-def _system_prompt() -> str:
+def _recent_context(wa_id: str | None) -> str:
+    rows = db.recent_logged(wa_id, 5) if wa_id else []
+    if not rows:
+        return ""
+    items = "; ".join(f"#{r['id']} {r['spent_on']} {r['amount']:g} {r['description']} ({r['category']})" for r in rows)
+    return f" The user's latest entries, newest first: {items}."
+
+
+def _system_prompt(wa_id: str | None = None) -> str:
     t = db.now()
     return (
         "You parse messages for a personal expense tracker used in India (amounts in INR). "
@@ -142,7 +167,12 @@ def _system_prompt() -> str:
         "'where does my money go'/'breakdown' -> total grouped by category; 'X vs Y' -> fill compare_*. "
         "Budgets are monthly: 'my food budget is 6k', 'keep shopping under 3000', 'I want to spend 30k a month' "
         "-> intent=settings. Only create a category when the user explicitly asks for one; when logging, "
-        "pick the closest existing category (including the user's own ones)."
+        "pick the closest existing category (including the user's own ones). "
+        "Corrections to something already logged ('oh no its 4000 not 400', 'change that to food', "
+        "'#8 was yesterday') -> intent=edit on that entry (the latest one unless they say which); "
+        "never log it again as a new expense. Only the app changes data: never reply as if you "
+        "updated, deleted or saved anything when using intent=chat."
+        + _recent_context(wa_id)
     )
 
 
@@ -166,20 +196,20 @@ async def parse(text: str = "", image: bytes | None = None, image_mime: str = "i
         return ParseResult("chat", reply="Photos aren't turned on. Type it instead, like *1834 dmart*.")
     try:
         if provider == "claude" and config.ANTHROPIC_API_KEY:
-            data = await _claude(text, image, image_mime, tool)
+            data = await _claude(text, image, image_mime, tool, wa_id)
         elif provider == "gemini" and config.GEMINI_API_KEY:
-            data = await _gemini(text, image, image_mime, tool)
+            data = await _gemini(text, image, image_mime, tool, wa_id)
         else:
-            return fallback_parse(text)
+            return fallback_parse(text, wa_id)
     except Exception:
         log.exception("%s parse failed, using fallback", provider)
         if text:
-            return fallback_parse(text)
+            return fallback_parse(text, wa_id)
         return ParseResult("chat", reply="Couldn't read that image right now - type the amount instead?")
     return _from_tool(data, cats)
 
 
-async def _claude(text, image, image_mime, tool=TOOL) -> dict:
+async def _claude(text, image, image_mime, tool=TOOL, wa_id=None) -> dict:
     content = []
     if image:
         content.append({
@@ -191,7 +221,7 @@ async def _claude(text, image, image_mime, tool=TOOL) -> dict:
     resp = await _get_client().messages.create(
         model=config.LLM_MODEL,
         max_tokens=1024,
-        system=_system_prompt(),
+        system=_system_prompt(wa_id),
         tools=[tool],
         tool_choice={"type": "tool", "name": "record"},
         messages=[{"role": "user", "content": content}],
@@ -211,7 +241,7 @@ def _gemini_http():
     return _http
 
 
-async def _gemini(text, image, image_mime, tool=TOOL) -> dict:
+async def _gemini(text, image, image_mime, tool=TOOL, wa_id=None) -> dict:
     """Same JSON schema as the Claude tool, via generateContent's structured output."""
     import json
 
@@ -220,7 +250,7 @@ async def _gemini(text, image, image_mime, tool=TOOL) -> dict:
         parts.append({"inline_data": {"mime_type": image_mime, "data": base64.b64encode(image).decode()}})
     parts.append({"text": text or "(receipt photo, no caption)"})
     body = {
-        "system_instruction": {"parts": [{"text": _system_prompt()}]},
+        "system_instruction": {"parts": [{"text": _system_prompt(wa_id)}]},
         "contents": [{"role": "user", "parts": parts}],
         "generationConfig": {
             "responseMimeType": "application/json",
@@ -257,16 +287,34 @@ def _from_tool(data: dict, cats: list[str] | None = None) -> ParseResult:
         intent = "chat"
     if intent == "settings" and not isinstance(data.get("settings"), dict):
         intent = "chat"
+    edit = data.get("edit") if isinstance(data.get("edit"), dict) else {}
+    if edit.get("category") and edit["category"] not in cats:
+        edit.pop("category")
+    if intent == "edit" and not any(edit.get(k) for k in ("amount", "category", "description", "date")):
+        intent = "chat"
     return ParseResult(intent, exps, data.get("command", ""), data.get("reply", ""),
-                       data.get("query") or {}, data.get("settings") or {})
+                       data.get("query") or {}, data.get("settings") or {}, edit)
 
 
 # ---------------- offline fallback ----------------
 _AMOUNT = re.compile(r"(?:rs\.?|inr|₹)?\s*(\d+(?:[.,]\d+)?)\s*(k)?\b", re.I)
+_NUM = r"(?:rs\.?|₹)?\s*(\d+(?:\.\d+)?k?)"
+_CORRECTION = re.compile(_NUM + r"\s*,?\s+not\s+" + _NUM + r"\b", re.I)
 
 
-def fallback_parse(text: str) -> ParseResult:
-    """Handles '220 swiggy', 'swiggy 220', 'chai 20, auto 80' and '1.2k shoes'."""
+def _to_amount(s: str) -> float:
+    s = s.lower()
+    return float(s[:-1]) * 1000 if s.endswith("k") else float(s)
+
+
+def fallback_parse(text: str, wa_id: str | None = None) -> ParseResult:
+    """Handles '220 swiggy', 'swiggy 220', 'chai 20, auto 80', '1.2k shoes' and '4000 not 400'."""
+    m = _CORRECTION.search(text or "")
+    if m:  # "its 4000 not 400": fix the recent entry that has the wrong amount
+        new, old = _to_amount(m.group(1)), _to_amount(m.group(2))
+        rows = db.recent_logged(wa_id, 5) if wa_id else []
+        match = next((r for r in rows if abs(r["amount"] - old) < 0.01), None)
+        return ParseResult("edit", edit={"id": match["id"] if match else None, "amount": new})
     items = [p.strip() for p in re.split(r"[,\n;]+", text or "") if p.strip()]
     exps = []
     for item in items:
